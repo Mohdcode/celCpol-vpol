@@ -1,0 +1,47 @@
+apiVersion: policies.kyverno.io/v1alpha1
+kind: ValidatingPolicy
+metadata:
+    annotations:
+        kyverno.io/kubernetes-version: 1.26-1.27
+        kyverno.io/kyverno-version: 1.11.0
+        policies.kyverno.io/category: Other in CEL
+        policies.kyverno.io/description: In instances where a ClusterPolicy defines all the approved image registries is insufficient, more granular control may be needed to set permitted registries, especially in multi-tenant use cases where some registries may be based on the Namespace. This policy shows an advanced version of the Restrict Image Registries policy which gets a global approved registry from a ConfigMap and, based upon an annotation at the Namespace level, gets the registry approved for that Namespace.
+        policies.kyverno.io/minversion: 1.11.0
+        policies.kyverno.io/severity: medium
+        policies.kyverno.io/subject: Pod
+        policies.kyverno.io/title: Advanced Restrict Image Registries in CEL expressions
+    name: advanced-restrict-image-registries
+spec:
+    WebhookConfiguration:
+        failurePolicy: Ignore
+        timeoutSeconds: 30
+    evaluation:
+        admission:
+            enabled: false
+        background:
+            enabled: true
+    failurePolicy: Ignore
+    matchConstraints:
+        resourceRules:
+            - apiGroups:
+                - ""
+              apiVersions:
+                - v1
+              operations:
+                - CREATE
+                - UPDATE
+              resources:
+                - deployments
+                - pods
+    validationActions:
+        - Audit
+    validations:
+        - expression: variables.allContainers.all(container, container.image.startsWith(variables.nsregistries) || container.image.startsWith(variables.clusterregistries))
+          message: This Pod names an image that is not from an approved registry.
+    variables:
+        - expression: object.spec.containers + object.spec.?initContainers.orValue([]) + object.spec.?ephemeralContainers.orValue([])
+          name: allContainers
+        - expression: namespaceObject.metadata.?annotations[?'corp.com/allowed-registries'].orValue(' ')
+          name: nsregistries
+        - expression: params.data[?'registries'].orValue(' ')
+          name: clusterregistries
