@@ -3,12 +3,15 @@ package main
 import (
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 
 	// "github.com/kyverno/kyverno/pkg/config"
 	// policyvalidation "github.com/kyverno/kyverno/pkg/validation/policy"
-	"gopkg.in/yaml.v3"
+
+	yaml "sigs.k8s.io/kustomize/kyaml/yaml"
+	// "gopkg.in/yaml.v3"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -54,26 +57,34 @@ type ValidatingPolicy struct {
 }
 
 // getGVRFromKind resolves GroupVersionResource for a given Kind using the Kubernetes scheme
-func getGVRFromKind(kind string) (schema.GroupVersionResource, error) {
+func getResourceFromKind(kind string) (string, error) {
+	// Build a RESTMapper only from the known types registered in scheme.Scheme
 	restMapper := meta.NewDefaultRESTMapper([]schema.GroupVersion{})
+
 	for gvk := range scheme.Scheme.AllKnownTypes() {
-		restMapper.Add(schema.GroupVersionKind{
-			Group:   gvk.Group,
-			Version: gvk.Version,
-			Kind:    gvk.Kind,
-		}, meta.RESTScopeNamespace)
+		// scope could be Namespace or Cluster, but for static mapping
+		// we can just pick Namespace by default
+		restMapper.Add(gvk, meta.RESTScopeNamespace)
 	}
 
 	mapping, err := restMapper.RESTMapping(schema.GroupKind{Kind: kind})
 	if err != nil {
-		// fallback: guess plural form and empty group/version
-		return schema.GroupVersionResource{
-			Group:    "",
-			Version:  "v1",
-			Resource: strings.ToLower(kind) + "s",
-		}, nil
+		log.Print("didn't excute")
+		log.Printf("this is the err %s,", err)
+		// fallback for irregular plurals
+		switch kind {
+		case "Ingress":
+			return "ingresses", nil
+		case "Policy":
+			return "policies", nil
+		case "NetworkPolicy":
+			return "networkpolicies", nil
+		}
+		// generic fallback: just lowercase + "s"
+		return strings.ToLower(kind) + "s", nil
 	}
-	return mapping.Resource, nil
+
+	return mapping.Resource.Resource, nil
 }
 
 func toStringSlice(raw interface{}) []string {
@@ -94,7 +105,7 @@ func toStringSlice(raw interface{}) []string {
 	}
 }
 
-func convert(cp ClusterPolicy) ValidatingPolicy {
+func convert(cp ClusterPolicy) (ValidatingPolicy, error) {
 	if !strings.HasPrefix(cp.APIVersion, "kyverno.io/v") {
 		fmt.Println("Input is not a Kyverno ClusterPolicy. Skipping conversion.")
 		os.Exit(0)
@@ -138,7 +149,6 @@ func convert(cp ClusterPolicy) ValidatingPolicy {
 	}
 	vp.Spec["failurePolicy"] = cp.Spec.WebhookConfiguration.FailurePolicy
 	vp.Spec["WebhookConfiguration"] = map[string]interface{}{
-		"failurePolicy":  cp.Spec.WebhookConfiguration.FailurePolicy,
 		"timeoutSeconds": cp.Spec.WebhookConfiguration.TimeoutSecond,
 	}
 
@@ -170,31 +180,21 @@ func convert(cp ClusterPolicy) ValidatingPolicy {
 				}
 
 				kindsRaw, _ := resourcesObj["kinds"].([]interface{})
-				groupSet := sets.NewString()
-				versionSet := sets.NewString()
 				resourceSet := sets.NewString()
 
 				for _, k := range kindsRaw {
 					kindStr := fmt.Sprintf("%v", k)
-					gvr, err := getGVRFromKind(kindStr)
+					gvr, err := getResourceFromKind(kindStr)
 					if err != nil {
 						// fallback (should rarely happen)
-						gvr = schema.GroupVersionResource{
-							Group:    "",
-							Version:  "v1",
-							Resource: strings.ToLower(kindStr) + "s",
-						}
+						return ValidatingPolicy{}, fmt.Errorf("failed to get gvr, %s", err)
 					}
-					groupSet.Insert(gvr.Group)
-					versionSet.Insert(gvr.Version)
-					resourceSet.Insert(gvr.Resource)
+					resourceSet.Insert(gvr)
 				}
 
 				resourceRules = append(resourceRules, map[string]interface{}{
-					"apiGroups":   groupSet.List(),
-					"apiVersions": versionSet.List(),
-					"operations":  ops,
-					"resources":   resourceSet.List(),
+					"operations": ops,
+					"resources":  resourceSet.List(),
 				})
 			}
 		}
@@ -207,15 +207,20 @@ func convert(cp ClusterPolicy) ValidatingPolicy {
 		}
 		if len(rule.Validate.Cel.Expressions) > 0 {
 			for _, expr := range rule.Validate.Cel.Expressions {
-				val := map[string]interface{}{
-					"expression": expr["expression"],
+				val := map[string]interface{}{}
+				if exp, ok := expr["expression"].(string); ok {
+					val["expression"] = exp
+
 				}
+				log.Print(val)
+
 				if msg, ok := expr["message"].(string); ok {
 					val["message"] = msg
 				}
 				if msg, ok := expr["messageExpression"].(string); ok {
 					val["messageExpression"] = msg
 				}
+
 				validations = append(validations, val)
 			}
 		}
@@ -243,7 +248,7 @@ func convert(cp ClusterPolicy) ValidatingPolicy {
 		}
 	}
 
-	return vp
+	return vp, nil
 }
 
 func main() {
@@ -271,8 +276,12 @@ func main() {
 		panic(err)
 	}
 
-	vp := convert(cp)
+	vp, err := convert(cp)
+	if err != nil {
+		panic(err)
+	}
 	outData, err := yaml.Marshal(vp)
+	log.Print(string(outData))
 	if err != nil {
 		panic(err)
 	}
